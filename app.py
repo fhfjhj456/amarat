@@ -43,7 +43,6 @@ def recognize_speech(audio_segment: AudioSegment) -> str:
         return ""
 
 def send_to_telegram(text: str, file_url: str):
-    # שולח רק את הטקסט, בלי קישור להקלטה
     message = f"🎙️ הודעה חדשה מהמערכת:\n\n{text}"
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message})
@@ -54,7 +53,7 @@ def send_to_telegram(text: str, file_url: str):
 def upload_audio():
     file_url = request.args.get("file_url")
 
-    # ✅ הגדרת הטוקן פעם אחת לשימוש בהמשך
+    # ✅ נכניס את הטוקן כאן למעלה, לפני השימוש בו
     system_token = "0733181406:80809090"
 
     # ✅ תמיכה בימות המשיח – שימוש בפרמטר stockname אם file_url חסר
@@ -67,11 +66,11 @@ def upload_audio():
 
     # ✅ אם file_url לא מכיל http, נניח שזה נתיב מקומי מימות ונבנה URL מלא
     if not file_url.startswith("http"):
-        # הסרת קווים מיותרים
         file_url = file_url.strip("/")
         file_url = f"https://www.call2all.co.il/ym/api/DownloadFile?token={system_token}&path=ivr2:/{file_url}"
 
     logging.info(f"Downloading audio from: {file_url}")
+
     try:
         response = requests.get(file_url, timeout=15)
         if response.status_code != 200:
