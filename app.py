@@ -17,6 +17,10 @@ logging.basicConfig(
 
 app = Flask(__name__)
 
+# --- משתנה פנימי לסימון תוכן לא חדשותי ---
+# המחרוזת הזו תשמש לבדיקה אם ה-AI החליט שהתוכן אינו חדשותי.
+NON_NEWS_MARKER = "[[NON_NEWS_CONTENT]]"
+
 # ------------------ Telegram & Gemini Config ------------------
 # אסימוני טלגרם מתוך הקוד המקורי שלך:
 TELEGRAM_BOT_TOKEN = "8183670381:AAEkIUh-P7pU6HbMmHY_eqjSU2_6Qfnqnic"
@@ -55,24 +59,28 @@ def recognize_speech(audio_segment: AudioSegment) -> str:
 def send_to_telegram(text: str):
     """שולח הודעה טקסטואלית נקייה לצ'אט היעד."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    # שליחה ללא parse_mode כדי לוודא טקסט נקי, כפי שביקשת
+    # שליחה ללא parse_mode או עיצוב נוסף כדי לוודא טקסט נקי
     requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text})
 
-# --- פונקציה חדשה: סיכום טקסט באמצעות Gemini AI ---
+# --- פונקציה: סיכום טקסט באמצעות Gemini AI ---
 def summarize_text_with_gemini(text_to_summarize: str) -> str:
     """
-    מבצע קריאת API למודל Gemini כדי לסכם טקסט חדשותי בצורה קצרה ותמציתית.
-    המודל מונחה להחזיר רק את הטקסט המסוכם, ללא תוספות או כותרות.
+    מבצע קריאת API למודל Gemini לסיכום. אם לא חדשותי, מחזיר את ה-NON_NEWS_MARKER.
     """
     if not text_to_summarize or not GEMINI_API_KEY:
-        logging.warning("Skipping Gemini summarization: Text or API Key is missing. Returning original text.")
-        # מחזיר הודעה קצרה המציינת את הכשל אם אין מפתח
-        return "❌ שגיאת AI: לא ניתן לבצע סיכום. נא לוודא כי GEMINI_API_KEY מוגדר." 
+        logging.warning("Skipping Gemini summarization: Text or API Key is missing.")
+        # במקרה של כשל בהגדרות, שולח את המחרוזת המקורית כדי לוודא שאחת ההודעות נשלחת
+        return text_to_summarize
 
     API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent"
     
-    # הנחיית המערכת: מונחית להחזיר רק את הטקסט המסוכם
-    system_prompt = "אתה עורך חדשות. סכם את הטקסט המועתק (תמלול אודיו) לדיווח חדשותי קצר, תמציתי ורשמי. השתמש בשפה עברית ברורה. הדיווח צריך להיות עד שתי פסקאות קצרות בלבד. *אל* תוסיף כותרות, הקדמות או משפטי סיום. הפלט שלך צריך להיות רק הטקסט המסוכם."
+    # הנחיית המערכת: כוללת הנחיה מפורשת לסימון תוכן לא חדשותי
+    system_prompt = (
+        "אתה עורך חדשות. סכם את הטקסט המועתק (תמלול אודיו) לדיווח חדשותי קצר, תמציתי ורשמי. "
+        "השתמש בשפה עברית ברורה. הדיווח צריך להיות עד שתי פסקאות קצרות בלבד. "
+        "*אל* תוסיף כותרות, הקדמות או משפטי סיום. הפלט שלך צריך להיות רק הטקסט המסוכם. "
+        f"אם הטקסט לא מכיל דיווח חדשותי רלוונטי (כגון ברכות, שיחה אישית או תוכן שאינו חדשות), הפלט שלך צריך להיות *רק* המחרוזת: {NON_NEWS_MARKER}"
+    )
     
     payload = {
         "contents": [
@@ -90,7 +98,7 @@ def summarize_text_with_gemini(text_to_summarize: str) -> str:
         'Content-Type': 'application/json'
     }
 
-    # יישום Exponential Backoff לטיפול בכשלים זמניים ב-API
+    # יישום Exponential Backoff
     max_retries = 3
     for attempt in range(max_retries):
         try:
@@ -104,11 +112,11 @@ def summarize_text_with_gemini(text_to_summarize: str) -> str:
             response.raise_for_status()
             
             result = response.json()
-            generated_text = result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text')
+            generated_text = result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', '').strip()
             
             if generated_text:
                 logging.info("Gemini summarization successful.")
-                return generated_text.strip() # מוודא שהפלט נקי מרווחים מיותרים
+                return generated_text.strip()
             
         except requests.exceptions.RequestException as e:
             logging.error(f"Attempt {attempt + 1} failed to call Gemini API: {e}")
@@ -118,14 +126,14 @@ def summarize_text_with_gemini(text_to_summarize: str) -> str:
                 time.sleep(wait_time)
             else:
                 logging.error("All retries failed for Gemini API.")
-                # במקרה של כשל סופי, מחזירים הודעת שגיאה ואת הטקסט המקורי
-                return f"❌ כשל בסיכום AI. הטקסט המקורי: \n\n{text_to_summarize}"
+                # במקרה של כשל סופי, מחזיר את מחרוזת המקור (כדי שתמיד תשלח הודעה אם התמלול עבד)
+                return text_to_summarize 
         except Exception as e:
             logging.error(f"Error processing Gemini response: {e}")
             break
 
-    # Fallback אחרון במקרה שהקוד לא הגיע ל-return בתוך הלולאה
-    return "❌ שגיאה כללית בסיכום AI. הטקסט המקורי:\n" + text_to_summarize
+    # Fallback אחרון 
+    return text_to_summarize
 
 # ------------------ API Endpoint ------------------
 
@@ -165,27 +173,31 @@ def upload_audio():
             recognized_text = recognize_speech(processed_audio)
 
             if recognized_text:
-                
                 # --- שלב 1: שליחת ההודעה הראשונה (תמלול מקורי) ---
                 send_to_telegram(recognized_text)
                 logging.info("Sent Message 1: Original Transcription.")
                 
-                # --- שלב 2: סיכום הטקסט ושליחת ההודעה השנייה (סיכום AI) ---
+                # --- שלב 2: סיכום הטקסט ובדיקת הסינון ---
                 summarized_text = summarize_text_with_gemini(recognized_text)
-                send_to_telegram(summarized_text)
-                logging.info("Sent Message 2: AI Summarized Text.")
+                
+                # ✅ שינוי 1: אם התוכן לא חדשותי (מחזיר את ה-MARKER), לא שולחים את ההודעה השנייה.
+                if summarized_text.strip() != NON_NEWS_MARKER:
+                    send_to_telegram(summarized_text)
+                    logging.info("Sent Message 2: AI Summarized Text.")
+                else:
+                    logging.info("Skipped sending AI summary: Content was marked as non-news.")
                 # --- סוף השינוי ---
                 
                 return jsonify({"recognized_text": recognized_text, "summarized_text": summarized_text})
+            
             else:
-                # אם לא זוהה טקסט, נשלח הודעה בהתאם
-                error_msg = f"❌ לא זוהה דיבור. (קובץ: {file_url})"
-                send_to_telegram(error_msg)
+                # ✅ שינוי 2: אם לא זוהה דיבור, לא שולחים הודעה לטלגרם כלל.
+                logging.info("Skipped sending any message: No speech recognized.")
                 return jsonify({"recognized_text": ""})
 
     except Exception as e:
         logging.error(f"Error: {e}")
-        # במקרה של כשל כללי, נשלח הודעת שגיאה לטלגרם
+        # במקרה של כשל קריטי, עדיין רצוי ליידע את המשתמש באמצעות טלגרם (אם כי זה מחוץ ללוגיקת 'לא זוהה דיבור')
         error_message = f"❌ **שגיאה קריטית בעיבוד**\nאירעה שגיאה בשרת: `{str(e)}`"
         send_to_telegram(error_message)
         return jsonify({"error": str(e)}), 500
@@ -194,3 +206,4 @@ def upload_audio():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
