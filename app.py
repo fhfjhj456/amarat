@@ -3,7 +3,7 @@ import tempfile
 import logging
 import requests
 import json
-# יבוא של time נשמר מהקוד המקורי, אם כי לא בשימוש פעיל
+import time # נשאר מהקוד המקורי
 from flask import Flask, request, jsonify 
 from pydub import AudioSegment
 import speech_recognition as sr
@@ -16,9 +16,6 @@ logging.basicConfig(
 )
 
 app = Flask(__name__)
-
-# --- משתנה פנימי לסימון תוכן לא חדשותי ---
-# NON_NEWS_MARKER הוסר, כעת ה-AI תמיד ינסח מחדש את התוכן.
 
 # ------------------ Telegram & Gemini Config ------------------
 # אסימוני טלגרם מתוך הקוד המקורי שלך:
@@ -61,23 +58,25 @@ def send_to_telegram(text: str):
     # שליחה ללא parse_mode או עיצוב נוסף כדי לוודא טקסט נקי
     requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text})
 
-# --- פונקציה: סיכום טקסט באמצעות Gemini AI (בניסיון אחד) ---
+# --- פונקציה: סיכום טקסט באמצעות Gemini AI (עם ניסיון חוזר יחיד) ---
 def summarize_text_with_gemini(text_to_summarize: str) -> str:
     """
-    מבצע קריאת API למודל Gemini לסיכום. כעת תמיד מנסח מחדש את התוכן.
+    מבצע קריאת API למודל Gemini לסיכום. מנסה פעמיים (ניסיון מקורי + ניסיון חוזר)
+    כדי להתגבר על שגיאות זמניות כמו 503.
     """
     if not text_to_summarize or not GEMINI_API_KEY:
         logging.warning("Skipping Gemini summarization: Text or API Key is missing.")
         return "❌ שגיאת AI: לא ניתן לבצע סיכום." 
 
     API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent"
-    
+    MAX_RETRIES = 2  # נסיון מקורי + נסיון חוזר אחד
+
     # הנחיית המערכת: מורה ל-AI לנסח מחדש כל טקסט לדיווח חדשותי (אין סינון)
     system_prompt = (
         "אתה עורך חדשות. נסח מחדש את הטקסט המועתק (תמלול אודיו) לדיווח חדשותי קצר, תמציתי ורשמי. "
         "השתמש בשפה עברית ברורה. הדיווח צריך להיות עד שתי פסקאות קצרות בלבד. "
         "*אל* תוסיף כותרות, הקדמות או משפטי סיום. הפלט שלך צריך להיות רק הטקסט המסוכם. "
-        "בכל מקרה, עליך לנסח מחדש את ההודעה כדיווח חדשותי רשמי. אם התוכן אינו חדשותי, נסח משפט רשמי קצר המתאר את התוכן."
+        "בכל מקרה, עליך לנסח מחדש את ההודעה כדיווח חדשותי. אם התוכן אינו חדשותי, נסח משפט רשמי קצר המתאר את התוכן בקצרה."
     )
     
     payload = {
@@ -95,32 +94,50 @@ def summarize_text_with_gemini(text_to_summarize: str) -> str:
     headers = {
         'Content-Type': 'application/json'
     }
+    
+    last_error = None
 
-    try:
-        response = requests.post(
-            f"{API_URL}?key={GEMINI_API_KEY}", 
-            headers=headers, 
-            data=json.dumps(payload),
-            timeout=20
-        )
-        response.raise_for_status() 
+    for attempt in range(MAX_RETRIES):
+        try:
+            # המתנה קצרה מאוד (למעט הניסיון הראשון) כדי לתת לשרת להתאושש
+            if attempt > 0:
+                time.sleep(1) # המתנה של שנייה אחת לפני ניסיון חוזר
 
-        result = response.json()
-        generated_text = result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', '').strip()
-        
-        if generated_text:
-            logging.info("Gemini summarization successful.")
-            return generated_text.strip()
-        
-        # Fallback אם ה-AI לא החזיר טקסט (נדיר)
-        return text_to_summarize 
+            response = requests.post(
+                f"{API_URL}?key={GEMINI_API_KEY}", 
+                headers=headers, 
+                data=json.dumps(payload),
+                timeout=20
+            )
+            response.raise_for_status() 
+            
+            # אם הצליח:
+            result = response.json()
+            generated_text = result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', '').strip()
+            
+            if generated_text:
+                logging.info(f"Gemini summarization successful on attempt {attempt + 1}.")
+                return generated_text.strip()
+            
+            # אם ה-AI לא החזיר טקסט מסיבה כלשהי
+            logging.warning(f"Gemini returned empty text on attempt {attempt + 1}. Continuing...")
+            return text_to_summarize
 
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Gemini API request failed immediately: {e}")
-        return f"❌ כשל בסיכום AI. הטקסט המקורי: \n{text_to_summarize}"
-    except Exception as e:
-        logging.error(f"Error processing Gemini response: {e}")
-        return "❌ שגיאה כללית בסיכום AI. הטקסט המקורי:\n" + text_to_summarize
+        except requests.exceptions.RequestException as e:
+            # אם השגיאה היא 503/429 (שגיאה זמנית), ננסה שוב
+            if response.status_code in [503, 429]:
+                 logging.warning(f"Gemini API temporary failure (Code {response.status_code}) on attempt {attempt + 1}. Retrying...")
+                 last_error = e
+                 continue
+            
+            # עבור כל שגיאה אחרת (כמו 400 Bad Request), אין טעם לנסות שוב
+            logging.error(f"Gemini API request failed permanently on attempt {attempt + 1}: {e}")
+            last_error = e
+            break # יציאה מהלולאה
+
+    # אם כל הניסיונות נכשלו:
+    logging.error(f"Gemini API failed after {MAX_RETRIES} attempts. Last error: {last_error}")
+    return f"❌ כשל בסיכום AI. הטקסט המקורי: \n{text_to_summarize}"
 
 # ------------------ API Endpoint for Keep-Alive ------------------
 
@@ -128,8 +145,6 @@ def summarize_text_with_gemini(text_to_summarize: str) -> str:
 def health_check():
     """
     נתיב לבדיקת תקינות (Health Check).
-    השתמש בנתיב זה כדי לשלוח קריאה כל 5-10 דקות (באמצעות Cron Job חיצוני)
-    כדי למנוע מהשרת להיכנס למצב שינה (Spin Down) ב-Render.
     """
     return jsonify({"status": "healthy", "message": "Server is awake and ready."}), 200
 
