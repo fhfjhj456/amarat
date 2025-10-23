@@ -3,8 +3,8 @@ import tempfile
 import logging
 import requests
 import json
-import time # נשאר כדי לא לשבור את מבנה הקוד, אך אינו בשימוש פעיל
-from flask import Flask, request, jsonify
+# יבוא של time נשמר מהקוד המקורי, אם כי לא בשימוש פעיל
+from flask import Flask, request, jsonify 
 from pydub import AudioSegment
 import speech_recognition as sr
 
@@ -18,8 +18,7 @@ logging.basicConfig(
 app = Flask(__name__)
 
 # --- משתנה פנימי לסימון תוכן לא חדשותי ---
-# המחרוזת הזו תשמש לבדיקה אם ה-AI החליט שהתוכן אינו חדשותי.
-NON_NEWS_MARKER = "[[NON_NEWS_CONTENT]]"
+# NON_NEWS_MARKER הוסר, כעת ה-AI תמיד ינסח מחדש את התוכן.
 
 # ------------------ Telegram & Gemini Config ------------------
 # אסימוני טלגרם מתוך הקוד המקורי שלך:
@@ -62,24 +61,23 @@ def send_to_telegram(text: str):
     # שליחה ללא parse_mode או עיצוב נוסף כדי לוודא טקסט נקי
     requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text})
 
-# --- פונקציה: סיכום טקסט באמצעות Gemini AI (הוסר מנגנון הניסיונות החוזרים להאצת התגובה) ---
+# --- פונקציה: סיכום טקסט באמצעות Gemini AI (בניסיון אחד) ---
 def summarize_text_with_gemini(text_to_summarize: str) -> str:
     """
-    מבצע קריאת API למודל Gemini לסיכום. אם לא חדשותי, מחזיר את ה-NON_NEWS_MARKER.
+    מבצע קריאת API למודל Gemini לסיכום. כעת תמיד מנסח מחדש את התוכן.
     """
     if not text_to_summarize or not GEMINI_API_KEY:
         logging.warning("Skipping Gemini summarization: Text or API Key is missing.")
-        # מחזיר הודעת שגיאה קצרה אם אין מפתח API
         return "❌ שגיאת AI: לא ניתן לבצע סיכום." 
 
     API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent"
     
-    # הנחיית המערכת: כוללת הנחיה מפורשת לסימון תוכן לא חדשותי
+    # הנחיית המערכת: מורה ל-AI לנסח מחדש כל טקסט לדיווח חדשותי (אין סינון)
     system_prompt = (
-        "אתה עורך חדשות. סכם את הטקסט המועתק (תמלול אודיו) לדיווח חדשותי קצר, תמציתי ורשמי. "
+        "אתה עורך חדשות. נסח מחדש את הטקסט המועתק (תמלול אודיו) לדיווח חדשותי קצר, תמציתי ורשמי. "
         "השתמש בשפה עברית ברורה. הדיווח צריך להיות עד שתי פסקאות קצרות בלבד. "
         "*אל* תוסיף כותרות, הקדמות או משפטי סיום. הפלט שלך צריך להיות רק הטקסט המסוכם. "
-        f"אם הטקסט לא מכיל דיווח חדשותי, הפלט שלך צריך להיות *רק* המחרוזת: {NON_NEWS_MARKER}"
+        "בכל מקרה, עליך לנסח מחדש את ההודעה כדיווח חדשותי רשמי. אם התוכן אינו חדשותי, נסח משפט רשמי קצר המתאר את התוכן."
     )
     
     payload = {
@@ -98,34 +96,42 @@ def summarize_text_with_gemini(text_to_summarize: str) -> str:
         'Content-Type': 'application/json'
     }
 
-    # ביצוע הקריאה היחידה ל-API ללא ניסיונות חוזרים (להשגת מהירות)
     try:
         response = requests.post(
             f"{API_URL}?key={GEMINI_API_KEY}", 
             headers=headers, 
             data=json.dumps(payload),
-            timeout=20 # ניתן להקטין את ה-timeout אם נדרש
+            timeout=20
         )
-        response.raise_for_status() # יעלה חריגה במקרה של 4xx/5xx
+        response.raise_for_status() 
 
         result = response.json()
-        # ודא שהתוצאה היא מחרוזת נקייה
         generated_text = result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', '').strip()
         
         if generated_text:
             logging.info("Gemini summarization successful.")
             return generated_text.strip()
         
-        # אם ה-API לא החזיר טקסט מסיבה כלשהי
+        # Fallback אם ה-AI לא החזיר טקסט (נדיר)
         return text_to_summarize 
 
     except requests.exceptions.RequestException as e:
-        # במקרה של כשל רשת או שגיאת API, השרת ימשיך מיד בלי לחכות
         logging.error(f"Gemini API request failed immediately: {e}")
         return f"❌ כשל בסיכום AI. הטקסט המקורי: \n{text_to_summarize}"
     except Exception as e:
         logging.error(f"Error processing Gemini response: {e}")
         return "❌ שגיאה כללית בסיכום AI. הטקסט המקורי:\n" + text_to_summarize
+
+# ------------------ API Endpoint for Keep-Alive ------------------
+
+@app.route("/health", methods=["GET"])
+def health_check():
+    """
+    נתיב לבדיקת תקינות (Health Check).
+    השתמש בנתיב זה כדי לשלוח קריאה כל 5-10 דקות (באמצעות Cron Job חיצוני)
+    כדי למנוע מהשרת להיכנס למצב שינה (Spin Down) ב-Render.
+    """
+    return jsonify({"status": "healthy", "message": "Server is awake and ready."}), 200
 
 # ------------------ API Endpoint ------------------
 
@@ -169,15 +175,12 @@ def upload_audio():
                 send_to_telegram(recognized_text)
                 logging.info("Sent Message 1: Original Transcription.")
                 
-                # --- שלב 2: סיכום הטקסט ובדיקת הסינון ---
+                # --- שלב 2: סיכום הטקסט (הפעם תמיד יבוצע ניסוח) ---
                 summarized_text = summarize_text_with_gemini(recognized_text)
                 
-                # אם התוכן לא חדשותי (מחזיר את ה-MARKER), לא שולחים את ההודעה השנייה.
-                if summarized_text.strip() != NON_NEWS_MARKER:
-                    send_to_telegram(summarized_text)
-                    logging.info("Sent Message 2: AI Summarized Text.")
-                else:
-                    logging.info("Skipped sending AI summary: Content was marked as non-news.")
+                # כעת, תמיד שולחים את ההודעה השנייה, כפי שנדרש.
+                send_to_telegram(summarized_text)
+                logging.info("Sent Message 2: AI Summarized Text (Unconditionally).")
                 
                 return jsonify({"recognized_text": recognized_text, "summarized_text": summarized_text})
             
@@ -188,7 +191,7 @@ def upload_audio():
 
     except Exception as e:
         logging.error(f"Error: {e}")
-        # במקרה של כשל קריטי, עדיין רצוי ליידע את המשתמש באמצעות טלגרם (אם כי זה מחוץ ללוגיקת 'לא זוהה דיבור')
+        # במקרה של כשל קריטי, עדיין רצוי ליידע את המשתמש באמצעות טלגרם 
         error_message = f"❌ **שגיאה קריטית בעיבוד**\nאירעה שגיאה בשרת: `{str(e)}`"
         send_to_telegram(error_message)
         return jsonify({"error": str(e)}), 500
