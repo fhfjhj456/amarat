@@ -3,7 +3,7 @@ import tempfile
 import logging
 import requests
 import json
-import time 
+import time # נשאר כדי לא לשבור את מבנה הקוד, אך אינו בשימוש פעיל
 from flask import Flask, request, jsonify
 from pydub import AudioSegment
 import speech_recognition as sr
@@ -62,15 +62,15 @@ def send_to_telegram(text: str):
     # שליחה ללא parse_mode או עיצוב נוסף כדי לוודא טקסט נקי
     requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text})
 
-# --- פונקציה: סיכום טקסט באמצעות Gemini AI ---
+# --- פונקציה: סיכום טקסט באמצעות Gemini AI (הוסר מנגנון הניסיונות החוזרים להאצת התגובה) ---
 def summarize_text_with_gemini(text_to_summarize: str) -> str:
     """
     מבצע קריאת API למודל Gemini לסיכום. אם לא חדשותי, מחזיר את ה-NON_NEWS_MARKER.
     """
     if not text_to_summarize or not GEMINI_API_KEY:
         logging.warning("Skipping Gemini summarization: Text or API Key is missing.")
-        # במקרה של כשל בהגדרות, שולח את המחרוזת המקורית כדי לוודא שאחת ההודעות נשלחת
-        return text_to_summarize
+        # מחזיר הודעת שגיאה קצרה אם אין מפתח API
+        return "❌ שגיאת AI: לא ניתן לבצע סיכום." 
 
     API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent"
     
@@ -90,7 +90,7 @@ def summarize_text_with_gemini(text_to_summarize: str) -> str:
             "parts": [{"text": system_prompt}]
         },
         "generationConfig": {
-            "temperature": 0.2, # טמפרטורה נמוכה לעמידה בסיכום עובדתי
+            "temperature": 0.2, 
         }
     }
     
@@ -98,42 +98,34 @@ def summarize_text_with_gemini(text_to_summarize: str) -> str:
         'Content-Type': 'application/json'
     }
 
-    # יישום Exponential Backoff
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            # הקריאה ל-API של ג'מיני
-            response = requests.post(
-                f"{API_URL}?key={GEMINI_API_KEY}", 
-                headers=headers, 
-                data=json.dumps(payload),
-                timeout=20
-            )
-            response.raise_for_status()
-            
-            result = response.json()
-            generated_text = result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', '').strip()
-            
-            if generated_text:
-                logging.info("Gemini summarization successful.")
-                return generated_text.strip()
-            
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Attempt {attempt + 1} failed to call Gemini API: {e}")
-            if attempt < max_retries - 1:
-                wait_time = 2 ** attempt
-                logging.info(f"Retrying in {wait_time} seconds...")
-                time.sleep(wait_time)
-            else:
-                logging.error("All retries failed for Gemini API.")
-                # במקרה של כשל סופי, מחזיר את מחרוזת המקור (כדי שתמיד תשלח הודעה אם התמלול עבד)
-                return text_to_summarize 
-        except Exception as e:
-            logging.error(f"Error processing Gemini response: {e}")
-            break
+    # ביצוע הקריאה היחידה ל-API ללא ניסיונות חוזרים (להשגת מהירות)
+    try:
+        response = requests.post(
+            f"{API_URL}?key={GEMINI_API_KEY}", 
+            headers=headers, 
+            data=json.dumps(payload),
+            timeout=20 # ניתן להקטין את ה-timeout אם נדרש
+        )
+        response.raise_for_status() # יעלה חריגה במקרה של 4xx/5xx
 
-    # Fallback אחרון 
-    return text_to_summarize
+        result = response.json()
+        # ודא שהתוצאה היא מחרוזת נקייה
+        generated_text = result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', '').strip()
+        
+        if generated_text:
+            logging.info("Gemini summarization successful.")
+            return generated_text.strip()
+        
+        # אם ה-API לא החזיר טקסט מסיבה כלשהי
+        return text_to_summarize 
+
+    except requests.exceptions.RequestException as e:
+        # במקרה של כשל רשת או שגיאת API, השרת ימשיך מיד בלי לחכות
+        logging.error(f"Gemini API request failed immediately: {e}")
+        return f"❌ כשל בסיכום AI. הטקסט המקורי: \n{text_to_summarize}"
+    except Exception as e:
+        logging.error(f"Error processing Gemini response: {e}")
+        return "❌ שגיאה כללית בסיכום AI. הטקסט המקורי:\n" + text_to_summarize
 
 # ------------------ API Endpoint ------------------
 
@@ -180,18 +172,17 @@ def upload_audio():
                 # --- שלב 2: סיכום הטקסט ובדיקת הסינון ---
                 summarized_text = summarize_text_with_gemini(recognized_text)
                 
-                # ✅ שינוי 1: אם התוכן לא חדשותי (מחזיר את ה-MARKER), לא שולחים את ההודעה השנייה.
+                # אם התוכן לא חדשותי (מחזיר את ה-MARKER), לא שולחים את ההודעה השנייה.
                 if summarized_text.strip() != NON_NEWS_MARKER:
                     send_to_telegram(summarized_text)
                     logging.info("Sent Message 2: AI Summarized Text.")
                 else:
                     logging.info("Skipped sending AI summary: Content was marked as non-news.")
-                # --- סוף השינוי ---
                 
                 return jsonify({"recognized_text": recognized_text, "summarized_text": summarized_text})
             
             else:
-                # ✅ שינוי 2: אם לא זוהה דיבור, לא שולחים הודעה לטלגרם כלל.
+                # אם לא זוהה דיבור, לא שולחים הודעה לטלגרם כלל.
                 logging.info("Skipped sending any message: No speech recognized.")
                 return jsonify({"recognized_text": ""})
 
@@ -206,4 +197,3 @@ def upload_audio():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
